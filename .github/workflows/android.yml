@@ -41,7 +41,6 @@ jobs:
       - name: Generate version (YYMMDD)
         id: parse_version
         run: |
-          # 获取 UTC 时间，格式化为 YYMMDD
           VERSION=$(date -u +%y%m%d)
           echo "Generated Version: $VERSION"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
@@ -86,7 +85,7 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew clean assembleRelease
 
-      # ✅ 用 run 判断 secret 是否存在，避免在 if 中使用 secrets
+      # ✅ 关键：用 run 判断 secret 是否存在，输出到 output，不在 if 中引用 secrets
       - name: Check if signing key is available
         id: check_signing
         run: |
@@ -97,6 +96,7 @@ jobs:
           fi
 
       - name: Sign Release
+        # ✅ if 中只使用 steps 输出，不碰 secrets
         if: ${{ steps.check_signing.outputs.SIGNING_AVAILABLE == 'true' }}
         id: sign_app
         uses: kevin-david/zipalign-sign-android-release@v2
@@ -109,6 +109,7 @@ jobs:
           zipAlign: true
 
       - name: Upload build artifact
+        # ✅ 安全判断
         if: ${{ steps.check_signing.outputs.SIGNING_AVAILABLE == 'true' && steps.sign_app.outputs.signedReleaseFile != '' }}
         uses: actions/upload-artifact@v4
         with:
@@ -116,11 +117,11 @@ jobs:
           path: ${{ steps.sign_app.outputs.signedReleaseFile }}
 
       - name: Release APK
+        # ✅ 安全判断
         if: ${{ steps.check_signing.outputs.SIGNING_AVAILABLE == 'true' && github.ref_type == 'tag' }}
         uses: ncipollo/release-action@v1
         with:
           token: ${{ github.token }}
-          # 如果是 tag 推送，使用 tag 名；否则使用日期版本
           tag: ${{ github.ref_type == 'tag' && github.ref_name || steps.parse_version.outputs.VERSION }}
           artifacts: ${{ steps.sign_app.outputs.signedReleaseFile }}
           generateReleaseNotes: true
