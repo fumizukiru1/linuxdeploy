@@ -71,12 +71,10 @@ jobs:
           ./gradlew clean assembleRelease
           echo "BUILD_TOOL_VERSION=29.0.2" >> $GITHUB_ENV
 
-      # 修复secrets引用：用${{ }}包裹变量
       - name: Sign Release
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOL_VERSION }}
-        # 正确语法：整个表达式在${{ }}内，secrets用${{ secrets.xxx }}
         if: ${{ secrets.SIGNING_KEY != '' }}
         continue-on-error: true
         uses: kevin-david/zipalign-sign-android-release@v2
@@ -92,7 +90,6 @@ jobs:
       - name: Upload build artifact
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-        # 修复：secrets变量需在${{ }}内
         if: ${{ secrets.SIGNING_KEY != '' && steps.sign_app.outputs.signedReleaseFile != '' }}
         uses: actions/upload-artifact@v4
         with:
@@ -100,12 +97,10 @@ jobs:
           path: ${{ steps.sign_app.outputs.signedReleaseFile }}
 
       - name: Post to channel
-        # 修复：secrets.BOT_TOKEN需改为${{ secrets.BOT_TOKEN }}
         if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag' && secrets.BOT_TOKEN != '' }}
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          # 修复字符串拼接：移除+，直接用变量拼接
           COMMIT_URL: ${{ github.event.head_commit.url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
           COMMIT_ID: ${{ github.event.head_commit.id }}
         run: |
@@ -121,7 +116,6 @@ jobs:
       - name: Release apk
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-        # 修复：secrets变量需在${{ }}内
         if: ${{ secrets.SIGNING_KEY != '' && github.ref_type == 'tag' }}
         continue-on-error: true
         uses: ncipollo/release-action@v1
