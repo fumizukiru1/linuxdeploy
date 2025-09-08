@@ -1,61 +1,145 @@
-name: Linux Deploy Build
+name: Build Manager
 
-# 触发条件：推送到 main 分支或创建 Pull Request 时
 on:
   push:
-    branches: [ main ]
+    tags: [ "*" ]
+    branches: [ "main" ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'app/**'
+      - 'apd/**'
+      - 'build.gradle.kts'
+      - 'gradle/libs.versions.toml'
   pull_request:
-    branches: [ main ]
+    branches: [ "main" ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'app/**'
+      - 'apd/**'
+      - 'build.gradle.kts'
+      - 'gradle/libs.versions.toml'
+  workflow_call:
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-manager:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 配置 Java 环境
+      - name: Generate version
+        id: parse_version
+        run: |
+          COMMIT_NUM=$(git rev-list --count HEAD)
+          VERSION=$(echo "$COMMIT_NUM + 200 + 10000" | bc)
+          echo "Generated Version: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          java-version: '11'  # 兼容 Gradle 3.6.1
-          distribution: 'temurin'
-          cache: gradle  # 缓存 Gradle 依赖
+          distribution: temurin
+          java-version: 8  # 匹配项目compileOptions的Java 1.8
 
-      - name: 安装 Android SDK 和构建工具
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 5.6.4  # 匹配项目gradle-wrapper版本
+
+      - name: Setup ninja
+        uses: seanmiddleditch/gha-setup-ninja@v6
+        with:
+          version: 1.12.1
+
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # 对应 app/build.gradle 中的 compileSdkVersion 和 buildToolsVersion
-          sdk-version: 29
-          build-tools-version: 29.0.2
-          # 安装 NDK（用于构建原生组件）
-          ndk-version: 21.4.7075529  # 兼容 ndk-build
+          # 安装项目所需的SDK版本和构建工具
+          packages: 'platforms;android-29 build-tools;29.0.2'
 
-      - name: 构建原生组件（pkgdetails）
+      # 移除冗余的Rust工具链（项目未使用Rust相关代码）
+      # - name: Install toolchain
+      #   run: |
+      #     rustup default stable
+      #     rustup update stable
+      #     cargo install cargo-ndk
+      #     rustup target install aarch64-linux-android
+
+      # - name: Cache Rust
+      #   uses: Swatinem/rust-cache@v2
+      #   with:
+      #     workspaces: apd
+      #     cache-targets: false
+
+      - name: Build with Gradle
         run: |
-          # 进入 pkgdetails 目录执行 ndk-build
-          cd contrib/pkgdetails
-          ndk-build
-          # 将构建产物复制到 assets 目录
-          mkdir -p ../../app/src/main/assets/bin/arm/
-          mkdir -p ../../app/src/main/assets/bin/intel/
-          mv libs/armeabi/pkgdetails ../../app/src/main/assets/bin/arm/
-          mv libs/x86/pkgdetails ../../app/src/main/assets/bin/intel/
+          echo 'org.gradle.parallel=true' >> gradle.properties
+          echo 'org.gradle.vfs.watch=true' >> gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx2048m' >> gradle.properties
+          echo 'android.native.buildOutput=verbose' >> gradle.properties
+          sed -i 's/org.gradle.configuration-cache=true//g' gradle.properties
+          ./gradlew clean assembleRelease
+          # 固定BUILD_TOOL_VERSION为项目所需版本
+          echo "BUILD_TOOL_VERSION=29.0.2" >> $GITHUB_ENV
 
-      - name: 赋予 Gradle 执行权限
-        run: chmod +x gradlew
-
-      - name: 构建 Release 版本 APK
-        run: ./gradlew assembleRelease
+      - name: Sign Release
         env:
-          # 若需要签名，添加签名信息（存储在 GitHub Secrets 中）
-          # KEYSTORE_PATH: ${{ secrets.KEYSTORE_PATH }}
-          # KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          # KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          # KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOL_VERSION }}
+        if: ${{ env.SIGNING_KEY != '' }}
+        continue-on-error: true
+        uses: kevin-david/zipalign-sign-android-release@v2
+        id: sign_app
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          zipAlign: true
 
-      - name: 上传构建产物（APK）
+      - name: Upload build artifact
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        if: ${{ env.SIGNING_KEY != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: linuxdeploy-apk
-          path: app/build/outputs/apk/release/*.apk
+          name: deploy
+          path: ${{steps.sign_app.outputs.signedReleaseFile}}
+
+      - name: Post to channel
+        if: ${{github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag'}}
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          COMMIT_ID: ${{ github.event.head_commit.id }}
+        run: |
+          if [ ! -z "${{ secrets.BOT_TOKEN }}" ]; then
+            OUTPUT="app/build/outputs/apk/release"
+            export Release=$(find $OUTPUT -name "*.apk")
+            URL=$(python3 .github/scripts/telegram_url.py -1002058433411)
+            curl -v "$URL" -F Release=@${{ steps.sign_app.outputs.signedReleaseFile }}
+            URL=$(python3 .github/scripts/telegram_url.py -1001910818234)
+            curl -v "$URL" -F Release=@${{ steps.sign_app.outputs.signedReleaseFile }}
+          fi
+
+      - name: Release apk
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        if: ${{ env.SIGNING_KEY != '' && github.ref_type == 'tag' }}
+        continue-on-error: true
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ github.token }}
+          # 修复tag冲突：推送tag时使用原tag名，否则使用生成的版本
+          tag: ${{ github.ref_type == 'tag' ? github.ref_name : steps.parse_version.outputs.VERSION }}
+          artifacts: ${{steps.sign_app.outputs.signedReleaseFile}}
+          generateReleaseNotes: true
+          makeLatest: true
+          replacesArtifacts: true
