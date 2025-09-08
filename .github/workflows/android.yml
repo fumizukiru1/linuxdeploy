@@ -1,3 +1,4 @@
+# .github/workflows/android.yml
 name: Build Manager
 
 on:
@@ -5,7 +6,7 @@ on:
     tags: [ "*" ]
     branches: [ "main" ]
     paths:
-      - '.github/workflows/build.yml'
+      - '.github/workflows/android.yml'
       - 'app/**'
       - 'apd/**'
       - 'build.gradle.kts'
@@ -15,7 +16,7 @@ on:
   pull_request:
     branches: [ "main" ]
     paths:
-      - '.github/workflows/build.yml'
+      - '.github/workflows/android.yml'
       - 'app/**'
       - 'apd/**'
       - 'build.gradle.kts'
@@ -31,22 +32,17 @@ jobs:
     permissions:
       contents: write
 
-    env:
-      # 👇 代理变量：用于在 if 条件中判断 secret 是否“存在”
-      HAS_SIGNING_KEY: ${{ secrets.SIGNING_KEY || 'missing' }}
-      HAS_BOT_TOKEN: ${{ secrets.BOT_TOKEN || 'missing' }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Generate version
+      - name: Generate version (YYMMDD)
         id: parse_version
         run: |
-          COMMIT_NUM=$(git rev-list --count HEAD)
-          VERSION=$((COMMIT_NUM + 10200))
+          # 获取 UTC 时间，格式化为 YYMMDD
+          VERSION=$(date -u +%y%m%d)
           echo "Generated Version: $VERSION"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
@@ -90,9 +86,18 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew clean assembleRelease
 
+      # ✅ 用 run 判断 secret 是否存在，避免在 if 中使用 secrets
+      - name: Check if signing key is available
+        id: check_signing
+        run: |
+          if [ -n "${{ secrets.SIGNING_KEY }}" ]; then
+            echo "SIGNING_AVAILABLE=true" >> $GITHUB_OUTPUT
+          else
+            echo "SIGNING_AVAILABLE=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Sign Release
-        # ✅ 用 env 代理判断
-        if: ${{ env.HAS_SIGNING_KEY != 'missing' }}
+        if: ${{ steps.check_signing.outputs.SIGNING_AVAILABLE == 'true' }}
         id: sign_app
         uses: kevin-david/zipalign-sign-android-release@v2
         with:
@@ -104,42 +109,18 @@ jobs:
           zipAlign: true
 
       - name: Upload build artifact
-        # ✅ 双重判断：secret 存在 + 输出文件存在
-        if: ${{ env.HAS_SIGNING_KEY != 'missing' && steps.sign_app.outputs.signedReleaseFile != '' }}
+        if: ${{ steps.check_signing.outputs.SIGNING_AVAILABLE == 'true' && steps.sign_app.outputs.signedReleaseFile != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: APatch
           path: ${{ steps.sign_app.outputs.signedReleaseFile }}
 
-      - name: Post to Telegram channels
-        # ✅ 用 env 代理判断 BOT_TOKEN，同时避免 + 拼接
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag' && env.HAS_BOT_TOKEN != 'missing' }}
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          # ✅ 用 format() 替代 + 拼接
-          COMMIT_URL: ${{ github.event.head_commit.url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message || 'Manual/Workflow Dispatch Build' }}
-          COMMIT_ID: ${{ github.sha }}
-        run: |
-          SIGNED_FILE="${{ steps.sign_app.outputs.signedReleaseFile }}"
-          if [ -z "$SIGNED_FILE" ] || [ ! -f "$SIGNED_FILE" ]; then
-            echo "No signed APK found, skipping Telegram post."
-            exit 0
-          fi
-
-          CHANNELS="${{ secrets.TELEGRAM_CHANNEL_IDS || '-1002058433411 -1001910818234' }}"
-          for CHAT_ID in $CHANNELS; do
-            URL=$(python3 .github/scripts/telegram_url.py "$CHAT_ID")
-            echo "Posting to $CHAT_ID..."
-            curl -v "$URL" -F "Release=@$SIGNED_FILE"
-          done
-
       - name: Release APK
-        # ✅ 用 env 代理判断
-        if: ${{ env.HAS_SIGNING_KEY != 'missing' && github.ref_type == 'tag' }}
+        if: ${{ steps.check_signing.outputs.SIGNING_AVAILABLE == 'true' && github.ref_type == 'tag' }}
         uses: ncipollo/release-action@v1
         with:
           token: ${{ github.token }}
+          # 如果是 tag 推送，使用 tag 名；否则使用日期版本
           tag: ${{ github.ref_type == 'tag' && github.ref_name || steps.parse_version.outputs.VERSION }}
           artifacts: ${{ steps.sign_app.outputs.signedReleaseFile }}
           generateReleaseNotes: true
