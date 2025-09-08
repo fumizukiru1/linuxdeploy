@@ -10,6 +10,8 @@ on:
       - 'apd/**'
       - 'build.gradle.kts'
       - 'gradle/libs.versions.toml'
+      - 'gradle/wrapper/**'
+      - 'gradle.properties'
   pull_request:
     branches: [ "main" ]
     paths:
@@ -18,6 +20,8 @@ on:
       - 'apd/**'
       - 'build.gradle.kts'
       - 'gradle/libs.versions.toml'
+      - 'gradle/wrapper/**'
+      - 'gradle.properties'
   workflow_call:
   workflow_dispatch:
 
@@ -26,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,7 +41,7 @@ jobs:
         id: parse_version
         run: |
           COMMIT_NUM=$(git rev-list --count HEAD)
-          VERSION=$(echo "$COMMIT_NUM + 200 + 10000" | bc)
+          VERSION=$((COMMIT_NUM + 10200))  # 200 + 10000
           echo "Generated Version: $VERSION"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
@@ -44,12 +49,12 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 8  # 匹配项目compileOptions的Java 1.8
+          java-version: 8
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 5.6.4  # 匹配项目gradle-wrapper版本
+          gradle-version: 5.6.4
 
       - name: Setup ninja
         uses: seanmiddleditch/gha-setup-ninja@v6
@@ -59,42 +64,31 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # 安装项目所需的SDK版本和构建工具
           packages: 'platforms;android-29 build-tools;29.0.2'
 
-      # 移除冗余的Rust工具链（项目未使用Rust相关代码）
-      # - name: Install toolchain
-      #   run: |
-      #     rustup default stable
-      #     rustup update stable
-      #     cargo install cargo-ndk
-      #     rustup target install aarch64-linux-android
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
 
-      # - name: Cache Rust
-      #   uses: Swatinem/rust-cache@v2
-      #   with:
-      #     workspaces: apd
-      #     cache-targets: false
-
-      - name: Build with Gradle
+      - name: Configure Gradle properties
         run: |
           echo 'org.gradle.parallel=true' >> gradle.properties
           echo 'org.gradle.vfs.watch=true' >> gradle.properties
           echo 'org.gradle.jvmargs=-Xmx2048m' >> gradle.properties
           echo 'android.native.buildOutput=verbose' >> gradle.properties
-          sed -i 's/org.gradle.configuration-cache=true//g' gradle.properties
-          ./gradlew clean assembleRelease
-          # 固定BUILD_TOOL_VERSION为项目所需版本
-          echo "BUILD_TOOL_VERSION=29.0.2" >> $GITHUB_ENV
+          [ -f gradle.properties ] && sed -i 's/org.gradle.configuration-cache=true//g' gradle.properties || true
+
+      - name: Build with Gradle
+        run: ./gradlew clean assembleRelease
 
       - name: Sign Release
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-          BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOL_VERSION }}
-        if: ${{ env.SIGNING_KEY != '' }}
-        continue-on-error: true
-        uses: kevin-david/zipalign-sign-android-release@v2
+        if: ${{ secrets.SIGNING_KEY != '' }}
         id: sign_app
+        uses: kevin-david/zipalign-sign-android-release@v2
         with:
           releaseDirectory: app/build/outputs/apk/release
           signingKeyBase64: ${{ secrets.SIGNING_KEY }}
@@ -104,42 +98,41 @@ jobs:
           zipAlign: true
 
       - name: Upload build artifact
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-        if: ${{ env.SIGNING_KEY != '' }}
+        if: ${{ secrets.SIGNING_KEY != '' && steps.sign_app.outputs.signedReleaseFile != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: deploy
-          path: ${{steps.sign_app.outputs.signedReleaseFile}}
+          name: APatch
+          path: ${{ steps.sign_app.outputs.signedReleaseFile }}
 
-      - name: Post to channel
-        if: ${{github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag'}}
+      - name: Post to Telegram channels
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag' && secrets.BOT_TOKEN != '' }}
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          COMMIT_URL: ${{ github.event.head_commit.url }}
-          COMMIT_ID: ${{ github.event.head_commit.id }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || 'Manual/Workflow Dispatch Build' }}
+          COMMIT_URL: ${{ github.event.head_commit.url || github.server_url + '/' + github.repository + '/actions/runs/' + github.run_id }}
+          COMMIT_ID: ${{ github.sha }}
         run: |
-          if [ ! -z "${{ secrets.BOT_TOKEN }}" ]; then
-            OUTPUT="app/build/outputs/apk/release"
-            export Release=$(find $OUTPUT -name "*.apk")
-            URL=$(python3 .github/scripts/telegram_url.py -1002058433411)
-            curl -v "$URL" -F Release=@${{ steps.sign_app.outputs.signedReleaseFile }}
-            URL=$(python3 .github/scripts/telegram_url.py -1001910818234)
-            curl -v "$URL" -F Release=@${{ steps.sign_app.outputs.signedReleaseFile }}
+          SIGNED_FILE="${{ steps.sign_app.outputs.signedReleaseFile }}"
+          if [ -z "$SIGNED_FILE" ] || [ ! -f "$SIGNED_FILE" ]; then
+            echo "No signed APK found, skipping Telegram post."
+            exit 0
           fi
 
-      - name: Release apk
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-        if: ${{ env.SIGNING_KEY != '' && github.ref_type == 'tag' }}
-        continue-on-error: true
+          # 建议：将频道 ID 放入 secrets.TELEGRAM_CHANNEL_IDS，用空格或逗号分隔
+          CHANNELS="${{ secrets.TELEGRAM_CHANNEL_IDS || '-1002058433411 -1001910818234' }}"
+          for CHAT_ID in $CHANNELS; do
+            URL=$(python3 .github/scripts/telegram_url.py "$CHAT_ID")
+            echo "Posting to $CHAT_ID..."
+            curl -v "$URL" -F "Release=@$SIGNED_FILE"
+          done
+
+      - name: Release APK
+        if: ${{ secrets.SIGNING_KEY != '' && github.ref_type == 'tag' }}
         uses: ncipollo/release-action@v1
         with:
           token: ${{ github.token }}
-          # 修复tag冲突：推送tag时使用原tag名，否则使用生成的版本
-          tag: ${{ github.ref_type == 'tag' ? github.ref_name : steps.parse_version.outputs.VERSION }}
-          artifacts: ${{steps.sign_app.outputs.signedReleaseFile}}
+          tag: ${{ github.ref_type == 'tag' && github.ref_name || steps.parse_version.outputs.VERSION }}
+          artifacts: ${{ steps.sign_app.outputs.signedReleaseFile }}
           generateReleaseNotes: true
           makeLatest: true
           replacesArtifacts: true
